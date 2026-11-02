@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Comparative Benchmark under Compound Environmental Disturbances and Sensor Spoofing}
+\label{tab:ablation_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Architecture / Adaptation} & \textbf{ATE (m)} & \textbf{RMSE (m)} & \textbf{Max Jerk (m/s$^3$)} & \textbf{Step Latency ($\mu$s)} \\
+\midrule
+Classical EKF                & 4.6789 & 5.0720 & 274261.90 &     27.6 \\
+Variant 0 (RLS)              & 6.0818 & 7.3998 & 272369.13 &   1901.2 \\
+Variant 1 (SAC Freeze 0)     & 10.4033 & 13.2435 & 389700.00 &   2755.7 \\
+Variant 2 (SAC Freeze 1)     & 17.1363 & 22.7298 & 412157.38 &   2891.3 \\
+Variant 3 (SAC Freeze 2)     & 6.1420 & 7.4328 & 289510.43 &   3402.6 \\
+Variant 4 (SAC Freeze 3)     & 2.3077 & 2.5757 & 397866.93 &   2702.2 \\
+\bottomrule
+\end{tabular}
+\end{table}

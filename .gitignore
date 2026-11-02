@@ -5,8 +5,8 @@ __pycache__/
 *$py.class
 .vscode/
 .python-version
-checkpoints/
 *.pdf
 *.png
 .venv/
 models/__pycache__/
+envs/__pycache__/
