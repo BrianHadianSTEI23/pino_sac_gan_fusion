@@ -1,0 +1,10 @@
+direction.md
+
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+.python-version
+checkpoints/
+*.pdf
+*.png
