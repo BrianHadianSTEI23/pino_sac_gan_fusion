@@ -128,5 +128,150 @@ Verification checks:
 
 ---
 
+## Module 2: Pillar B (4-Layer Spectrally Normalized MLP & Fault Adapter)
+
+Module 2 implements the unmodeled disturbance wrench estimator ($\hat{F}_{\text{ext}}$) and the multi-modal trust adapter:
+
+1. **`SpectrallyNormalizedMLP`** (`models/pillar_b_sn_mlp.py`):
+   * **Input Dimension:** $18$ ($[\mathbf{v}\,(3), \boldsymbol{\omega}\,(3), \text{vec}(R)\,(9), \boldsymbol{\tau}_{\text{motors}}\,(3)]$).
+   * **Architecture:** $18 \to 64 \to 64 \to 64 \to 6$.
+   * **Spectral Normalization:** Applied to layers 1, 2, and 3 via `torch.nn.utils.parametrizations.spectral_norm`, mathematically enforcing Lipschitz continuity ($\|\text{Trunk}(x_1) - \text{Trunk}(x_2)\| \le L \|x_1 - x_2\|$).
+   * **Smooth Nonlinearity:** Smooth `Softplus(beta=1.0)` activations to eliminate gradient discontinuities during live adaptation.
+   * **`set_freeze_depth(num_frozen_layers)`:** Exact layer-freezing configuration for the 5-way continual adaptation benchmark:
+     * `depth=0`: All layers $\{1, 2, 3, 4\}$ trainable (SAC Freeze 0 / fully unfrozen).
+     * `depth=1`: Layer $\{1\}$ frozen; $\{2, 3, 4\}$ trainable (SAC Freeze 1).
+     * `depth=2`: Layers $\{1, 2\}$ frozen; $\{3, 4\}$ trainable (SAC Freeze 2).
+     * `depth=3`: Layers $\{1, 2, 3\}$ frozen; only head $\{4\}$ trainable (SAC Freeze 3 / RLS head update).
+   * **`forward_trunk(x)`:** Exposes feature representation $h_3 \in \mathbb{R}^{64}$ for analytical closed-form RLS updates.
+
+2. **`NoiseAndFaultAdapter`** (`models/pillar_b_sn_mlp.py`):
+   * Implements sliding-window ($W=10$) tracking of $r_{\text{sens}}$ and $r_{\text{phys}}$.
+   * Computes smooth instantaneous trust scores $\alpha_{\text{raw}, t} \in (0, 1)$ globally and per sensor modality:
+     $$\alpha_{\text{raw}, t} = \sigma\Big( k \cdot \big(\tau_{\text{thresh}} - (\|r_{\text{phys}, t}\|_2 + \|r_{\text{sens}, t}\|_2)\big) \Big)$$
+
+---
+
+## How to Test Module 2
+
+Run the standalone verification suite for Module 2:
+```bash
+python3 models/pillar_b_sn_mlp.py
+# or using the workspace virtualenv:
+# .venv/bin/python3 models/pillar_b_sn_mlp.py
+```
+
+**Intended Output:**
+```text
+======================================================================
+ Running Module 2 Verification: Pillar B (4-Layer SN-MLP & Fault Adapter)
+======================================================================
+Using compute device: cpu (or cuda)
+
+1. Model Architecture Initialized:
+SpectrallyNormalizedMLP(...)
+
+2. Forward Pass Verification:
+   • Input shape:        (16, 18)
+   • Trunk h3 shape:     (16, 64)  (Expected: (16, 64))
+   • Output F_ext shape: (16, 6)   (Expected: (16, 6))
+
+3. Testing Depth-Wise Layer Freezing Ablation Depths:
+   • Freeze Depth 0: 9926 trainable / 9926 total params (0 frozen)
+   • Freeze Depth 1: 8710 trainable / 9926 total params (1216 frozen)
+   • Freeze Depth 2: 4550 trainable / 9926 total params (5376 frozen)
+   • Freeze Depth 3: 390 trainable / 9926 total params (9536 frozen)
+   ✔ Depth-wise layer freezing verified successfully across all 4 depths!
+
+4. Empirical Lipschitz Bound Verification:
+   • Maximum empirical Lipschitz quotient ||h3(x1) - h3(x2)|| / ||x1 - x2||: 0.0355
+   ✔ Spectral normalization Lipschitz constraint verified!
+
+5. Testing NoiseAndFaultAdapter:
+   • Clean condition global trust score: 0.9924 (Expected > 0.90)
+   • Fault condition global trust score: 0.0001 (Expected < 0.05)
+   • GPS position modality trust score:  0.0001 (Expected < 0.01)
+   ✔ NoiseAndFaultAdapter verified successfully under clean and fault conditions!
+
+======================================================================
+✔ All Module 2 Verification checks passed successfully!
+======================================================================
+```
+
+---
+
+## Module 3: 5-Way Online Continual Adaptation Engine (RLS vs. Annealed SAC)
+
+Module 3 implements the live continual adaptation engine to compensate for external disturbances (e.g. wind gusts) and system parameter changes:
+
+1. **`RLSHeadAdapter` (Variant 0 Baseline)**:
+   * Freezes trunk layers $\{1, 2, 3\}$ of `SpectrallyNormalizedMLP` and updates the linear head $W_4 \in \mathbb{R}^{6 \times 64}$ ($+ b_4$) in closed-form via **Recursive Least Squares** with forgetting factor $\lambda_{\text{RLS}} = 0.995$.
+   * Driven directly by the Euler-Lagrange physics residual error signal:
+     $$\mathbf{e}_t = (\hat{F}_{\text{ext}} + r_{\text{phys}}) - \hat{F}_{\text{ext}} = r_{\text{phys}} \in \mathbb{R}^6$$
+   * Executes in sub-millisecond real time ($\approx 680\,\mu\text{s}$ per step), guaranteeing zero gradient latency.
+
+2. **`OnlineAnnealedSACAdapter` (Variants 1–4)**:
+   * **Actor:** `SpectrallyNormalizedMLP` with configurable layer freeze depth:
+     * **Variant 1 [SAC Freeze 0]:** Full unfrozen gradient adaptation across all 4 layers (9,926 parameters).
+     * **Variant 2 [SAC Freeze 1]:** Freeze layer 1, train layers 2–4 (8,710 parameters).
+     * **Variant 3 [SAC Freeze 2]:** Freeze layers 1–2, train layers 3–4 (4,550 parameters).
+     * **Variant 4 [SAC Freeze 3]:** Freeze layers 1–3, train only head layer 4 (390 parameters; direct gradient vs. convex RLS comparison).
+   * **Twin Q-Critics:** Evaluates state-wrench pairs against composite reward:
+     $$R_t = -\left(w_1 \|r_{\text{phys}, t}\|^2 + w_2 \|r_{\text{sens}, t}\|^2 + w_3 \|\Delta \hat{F}_{\text{ext}, t}\|^2\right)$$
+   * **Lightweight Ring Buffer:** Contiguous preallocated numpy circular replay buffer ($< 15\,\text{MB}$ memory).
+   * **Jitter-Free Entropy Annealing:**
+     $$\alpha_t = \alpha_0 \exp(-\beta t) \to 0$$
+     Decays exploration temperature smoothly to zero, eliminating high-frequency actuator chatter during live flight.
+
+---
+
+## How to Test Module 3
+
+Run the 5-way continual adaptation benchmark:
+```bash
+python3 models/continual_adapters.py
+# or via the workspace venv:
+# .venv/bin/python3 models/continual_adapters.py
+```
+
+**Intended Output:**
+```text
+===========================================================================
+ Running Module 3 Verification: 5-Way Online Continual Adaptation Engine
+===========================================================================
+Benchmarking single-step execution latency (100 steps each)...
+
+---------------------------------------------------------------------------
+Variant                      | Trainable  | Mean Latency   | p95 Latency 
+---------------------------------------------------------------------------
+Variant 0 [RLS Baseline]     | 390        |   687.73 µs     |   751.64 µs
+Variant 1 [SAC Freeze 0]     | 9926       | 52704.75 µs     | 65880.98 µs
+Variant 2 [SAC Freeze 1]     | 8710       | 30457.97 µs     | 31248.18 µs
+Variant 3 [SAC Freeze 2]     | 4550       | 25102.57 µs     | 31167.95 µs
+Variant 4 [SAC Freeze 3]     | 390        | 26154.46 µs     | 33724.42 µs
+---------------------------------------------------------------------------
+
+1. RLS Execution Latency: 687.73 µs (< 1000 µs sub-ms budget: True)
+
+2. Jitter-Free Entropy Annealing Verification:
+   • Initial Temperature alpha_0: 0.1970
+   • Annealed Temperature @ step 500: 0.000111 (Decayed to ~ 0.0)
+   • Initial Action Std Dev (Steps 1-50):   2.4040 N
+   • Annealed Action Std Dev (Steps 450-500): 0.0000 N (Decayed by 100.0%)
+   • Deterministic Deployment Action Std Dev: 0.000001 N (Zero Jitter: True)
+   ✔ Entropy annealing and jitter elimination verified!
+
+3. Closed-Form RLS Disturbance Tracking Verification:
+   • True Wind Wrench:      [ 4.5 -3.   1.5] N
+   • RLS Estimated Wrench:  [ 4.5 -3.   1.5] N
+   • Tracking Error Norm:   0.000637 N (Expected < 0.1 N)
+   ✔ RLS convex convergence verified!
+
+===========================================================================
+✔ All Module 3 Verification checks passed successfully!
+===========================================================================
+```
+
+---
+
 ## Next Steps
-* **Module 2:** Implement `models/pillar_b_sn_mlp.py` (4-Layer Spectrally Normalized MLP, `set_freeze_depth`, Lipschitz bound enforcement, and `NoiseAndFaultAdapter`).
+* **Module 4:** Implement `models/physics_cgan.py` (Conditional GAN with Path Optimality Discriminator $D_\psi$, Virtual Sensor Generator $G_\zeta$ conditioned on $[\mathcal{P}_{\text{lattice}}, y_{t-H:t}, \tau_{\text{motors}}, r_{\text{phys}}]$, and embedded Euler-Lagrange generator loss).

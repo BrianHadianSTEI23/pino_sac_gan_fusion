@@ -8,3 +8,5 @@ __pycache__/
 checkpoints/
 *.pdf
 *.png
+.venv/
+models/__pycache__/
