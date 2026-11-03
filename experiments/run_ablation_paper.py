@@ -34,7 +34,12 @@ from config import GlobalConfig, CONFIG
 from envs.uav_mujoco_env import UAVMujocoEnv
 from envs.smac_lattice_sim import SMACLatticePath, SE3GeometricController
 from models.pillar_b_sn_mlp import SpectrallyNormalizedMLP, NoiseAndFaultAdapter, extract_mlp_features
-from models.continual_adapters import create_continual_adapter, RLSHeadAdapter, OnlineAnnealedSACAdapter
+from models.continual_adapters import (
+    create_continual_adapter,
+    RLSHeadAdapter,
+    OnlineAnnealedSACAdapter,
+    PIN_ESN_Adapter
+)
 from models.physics_cgan import (
     PhysicsConditionedGenerator,
     PathOptimalityDiscriminator,
@@ -145,7 +150,7 @@ def run_single_mission(
     fault_adapter = NoiseAndFaultAdapter()
 
     # Base SN-MLP
-    base_mlp = SpectrallyNormalizedMLP(18, 64, 6).to(dev)
+    base_mlp = SpectrallyNormalizedMLP(18, 256, 6).to(dev)
     if os.path.exists(mlp_path):
         base_mlp.load_state_dict(torch.load(mlp_path, map_location=dev))
 
@@ -161,7 +166,8 @@ def run_single_mission(
             "Variant 1 [SAC Freeze 0]": 1,
             "Variant 2 [SAC Freeze 1]": 2,
             "Variant 3 [SAC Freeze 2]": 3,
-            "Variant 4 [SAC Freeze 3]": 4
+            "Variant 4 [SAC Freeze 3]": 4,
+            "Paradigm B [PIN-ESN]": 5
         }
         v_idx = variant_map[controller_type]
         continual_adapter = create_continual_adapter(v_idx, base_mlp=base_mlp, device=dev)
@@ -179,8 +185,10 @@ def run_single_mission(
         "est_pos": [],
         "r_phys": [],
         "r_sens": [],
+        "r_vis": [],
         "alpha_raw": [],
         "alpha_smoothed": [],
+        "alpha_vslam": [],
         "p_opt": [],
         "latencies_us": [],
         "pos_errors": [],
@@ -242,13 +250,28 @@ def run_single_mission(
             est_res = estimator.step(obs)
             alpha_raw = 1.0
             alpha_smoothed = 1.0
+            alpha_vslam = 1.0
+            r_vis = 0.0
             p_opt = 1.0
             f_ext_hat = np.zeros(6)
             est_pos = est_res["estimated_pos"]
         else:
-            # (A) Compute trust scores via Fault Adapter
+            # (A) Compute trust scores via Fault Adapter & Physics-Consistent Visual Gating (Novelty 1)
             trust_scores = fault_adapter.update(r_phys, r_sens)
             alpha_raw = trust_scores["global"]
+
+            vg_diag = fault_adapter.compute_visual_gating(
+                v_vslam=obs.get("vslam_vel", obs["gps_vel"]),
+                v_prev=prev_vel,
+                rot_matrix=true_st["rot_matrix"],
+                motor_thrusts=info["ctrl"],
+                f_ext_hat=locals().get("f_ext_hat", None),
+                dt=dt,
+                vslam_valid=obs.get("vslam_valid", True),
+                vslam_quality=obs.get("vslam_quality", 1.0)
+            )
+            alpha_vslam = vg_diag["alpha_vslam"]
+            r_vis = vg_diag["r_vis"]
 
             # (B) Virtual cGAN Sensor Inference (evaluated at 100 Hz / step % 5)
             if step % 5 == 0 or 'y_gan_cached' not in locals():
@@ -266,17 +289,20 @@ def run_single_mission(
             y_gan = y_gan_cached
             p_opt = p_opt_cached
 
-            # (C) Critically Damped Precision Blending (500 Hz)
-            y_fused, obs_diag = observer.fuse(
+            # (C) Tri-Brid Critically Damped Precision Blending (Novelty 2)
+            y_fused, obs_diag = observer.fuse_tri_brid(
                 y_real=current_sensor,
                 y_gan=y_gan,
-                alpha_raw=alpha_raw,
+                vslam_pos=obs.get("vslam_pos", obs["gps_pos"]),
+                vslam_vel=obs.get("vslam_vel", obs["gps_vel"]),
+                alpha_vslam=alpha_vslam,
+                alpha_gps=trust_scores.get("gps_pos", 1.0),
                 p_opt=p_opt
             )
             alpha_smoothed = obs_diag["alpha_smoothed"]
             est_pos = observer.estimated_pos
 
-            # (D) 5-Way Continual Disturbance Adaptation
+            # (D) Continual Disturbance Adaptation with Visual-Aided Reservoir (Novelty 3)
             mlp_feat = extract_mlp_features(
                 lin_vel=true_st["lin_vel"],
                 ang_vel=true_st["ang_vel"],
@@ -284,7 +310,11 @@ def run_single_mission(
                 tau_motors=info["ctrl"][:3]
             )
 
-            if isinstance(continual_adapter, RLSHeadAdapter):
+            delta_p_vis = (obs["vslam_pos"] - est_pos) if obs.get("vslam_valid", True) else np.zeros(3)
+
+            if isinstance(continual_adapter, PIN_ESN_Adapter):
+                f_ext_hat, _ = continual_adapter.update(mlp_feat, r_phys, delta_p_vis=delta_p_vis)
+            elif isinstance(continual_adapter, RLSHeadAdapter):
                 f_ext_hat, _ = continual_adapter.update(mlp_feat, r_phys)
             elif isinstance(continual_adapter, OnlineAnnealedSACAdapter):
                 f_ext_hat, _ = continual_adapter.select_action(mlp_feat, deterministic=True)
@@ -302,8 +332,10 @@ def run_single_mission(
         history["est_pos"].append(est_pos.copy())
         history["r_phys"].append(float(np.linalg.norm(r_phys)))
         history["r_sens"].append(float(np.linalg.norm(r_sens)))
+        history["r_vis"].append(float(r_vis))
         history["alpha_raw"].append(alpha_raw)
         history["alpha_smoothed"].append(alpha_smoothed)
+        history["alpha_vslam"].append(float(alpha_vslam))
         history["p_opt"].append(p_opt)
         history["latencies_us"].append(total_step_lat_us)
         history["pos_errors"].append(float(np.linalg.norm(true_st["pos"] - ref.pos)))
@@ -354,12 +386,13 @@ def generate_publication_artifacts(
     })
 
     palette = {
-        "Classical EKF": "#e74c3c",      # Red
-        "Variant 0 [RLS]": "#2ecc71",     # Green
-        "Variant 1 [SAC Freeze 0]": "#3498db", # Blue
-        "Variant 2 [SAC Freeze 1]": "#9b59b6", # Purple
-        "Variant 3 [SAC Freeze 2]": "#f39c12", # Orange
-        "Variant 4 [SAC Freeze 3]": "#1abc9c"  # Teal
+        "Classical EKF": "#e74c3c",          # Red
+        "Variant 0 [RLS]": "#2ecc71",         # Green
+        "Variant 1 [SAC Freeze 0]": "#3498db",# Blue
+        "Variant 2 [SAC Freeze 1]": "#9b59b6",# Purple
+        "Variant 3 [SAC Freeze 2]": "#f39c12",# Orange
+        "Variant 4 [SAC Freeze 3]": "#1abc9c",# Teal
+        "Paradigm B [PIN-ESN]": "#e67e22"     # Deep Amber
     }
 
     # --------------------------------------------------------------------------
@@ -369,15 +402,18 @@ def generate_publication_artifacts(
     ax1 = fig1.add_subplot(111, projection="3d")
 
     # Plot Reference Path
-    sample_hist = all_results["Variant 0 [RLS]"]["history"]
+    sample_key = "Variant 0 [RLS]" if "Variant 0 [RLS]" in all_results else list(all_results.keys())[0]
+    sample_hist = all_results[sample_key]["history"]
     ref_p = np.array(sample_hist["ref_pos"])
     ax1.plot(ref_p[:, 0], ref_p[:, 1], ref_p[:, 2], "k--", label="SMAC Lattice Reference", linewidth=2.2)
 
-    # Plot EKF, RLS, and SAC-0
-    for key in ["Classical EKF", "Variant 0 [RLS]", "Variant 1 [SAC Freeze 0]"]:
-        res = all_results[key]
-        tp = np.array(res["history"]["true_pos"])
-        ax1.plot(tp[:, 0], tp[:, 1], tp[:, 2], label=key, color=palette[key], alpha=0.9)
+    # Plot representative controllers (EKF, RLS, SAC-0, and PIN-ESN)
+    fig1_keys = ["Classical EKF", "Variant 0 [RLS]", "Variant 1 [SAC Freeze 0]", "Paradigm B [PIN-ESN]"]
+    for key in fig1_keys:
+        if key in all_results:
+            res = all_results[key]
+            tp = np.array(res["history"]["true_pos"])
+            ax1.plot(tp[:, 0], tp[:, 1], tp[:, 2], label=key, color=palette[key], alpha=0.9)
 
     ax1.set_xlabel("X (m)")
     ax1.set_ylabel("Y (m)")
@@ -401,12 +437,13 @@ def generate_publication_artifacts(
         ax.axvspan(4.0, 9.0, color="#f39c12", alpha=0.15, label="Wind Gust [4-9s]" if ax == ax2a else None)
         ax.axvspan(10.0, 15.0, color="#e74c3c", alpha=0.15, label="GPS Spoofing / Blackout [10-15s]" if ax == ax2a else None)
 
-    for key in ["Classical EKF", "Variant 0 [RLS]", "Variant 1 [SAC Freeze 0]"]:
-        res = all_results[key]
-        ax2a.plot(t_axis, res["history"]["pos_errors"], label=key, color=palette[key])
-        # Smooth jerk for visualization
-        jerk_smooth = np.convolve(res["history"]["control_jerk"], np.ones(25)/25, mode="same")
-        ax2b.plot(t_axis, jerk_smooth, label=key, color=palette[key])
+    for key in fig1_keys:
+        if key in all_results:
+            res = all_results[key]
+            ax2a.plot(t_axis, res["history"]["pos_errors"], label=key, color=palette[key])
+            # Smooth jerk for visualization
+            jerk_smooth = np.convolve(res["history"]["control_jerk"], np.ones(25)/25, mode="same")
+            ax2b.plot(t_axis, jerk_smooth, label=key, color=palette[key])
 
     ax2a.set_ylabel("Position Error (m)")
     ax2a.set_title("Fig 2: Tracking Error and Control Jerk Comparison")
@@ -423,36 +460,48 @@ def generate_publication_artifacts(
     plt.close(fig2)
 
     # --------------------------------------------------------------------------
-    # Figure 3: Explainable AI Dashboard
+    # Figure 3: Explainable AI Dashboard (Physics, Sensors, Visual Gating & Trust)
     # --------------------------------------------------------------------------
-    fig3, (ax3a, ax3b, ax3c) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    rls_hist = all_results["Variant 0 [RLS]"]["history"]
+    fig3, (ax3a, ax3b, ax3c, ax3d) = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
+    disp_key = "Paradigm B [PIN-ESN]" if "Paradigm B [PIN-ESN]" in all_results else ("Variant 0 [RLS]" if "Variant 0 [RLS]" in all_results else list(all_results.keys())[0])
+    rls_hist = all_results[disp_key]["history"]
 
-    # Physics residual
+    # (a) Physics residual
     ax3a.plot(t_axis, rls_hist["r_phys"], color="#2c3e50", label=r"Euler-Lagrange Residual $\| r_{\mathrm{phys}} \|$")
     ax3a.axhline(2.5, color="#e74c3c", linestyle="--", alpha=0.7, label=r"Threshold $\tau_{\mathrm{thresh}}$")
-    ax3a.axvspan(4.0, 9.0, color="#f39c12", alpha=0.15, label="Wind Gust")
-    ax3a.set_ylabel("Physics Res (N)")
-    ax3a.set_title("Fig 3: Explainable AI Dashboard (Residuals & Damped Trust Blending)")
+    ax3a.axvspan(4.0, 9.0, color="#f39c12", alpha=0.15, label="Wind Gust [4-9s]")
+    ax3a.set_ylabel(r"$\| r_{\mathrm{phys}} \|$ (N)")
+    ax3a.set_title(f"Fig 3: Explainable AI Dashboard - {disp_key} (Physics Residual, Visual Gating & Trust)")
     ax3a.legend(loc="upper right")
     ax3a.grid(True, linestyle=":", alpha=0.6)
 
-    # Sensor residual
+    # (b) Sensor residual
     ax3b.plot(t_axis, rls_hist["r_sens"], color="#8e44ad", label=r"Sensor Residual $\| r_{\mathrm{sens}} \|$")
-    ax3b.axvspan(10.0, 15.0, color="#e74c3c", alpha=0.15, label="GPS Spoofing")
-    ax3b.set_ylabel("Sensor Res")
+    ax3b.axvspan(10.0, 15.0, color="#e74c3c", alpha=0.15, label="GPS Spoofing / Blackout [10-15s]")
+    ax3b.set_ylabel(r"$\| r_{\mathrm{sens}} \|$")
     ax3b.legend(loc="upper right")
     ax3b.grid(True, linestyle=":", alpha=0.6)
 
-    # Trust weights: Raw vs Critically Damped + Discriminator p_opt
-    ax3c.plot(t_axis, rls_hist["alpha_raw"], color="#95a5a6", linestyle=":", label=r"Raw Trust $\alpha_{\mathrm{raw}}$")
-    ax3c.plot(t_axis, rls_hist["alpha_smoothed"], color="#27ae60", linewidth=2.0, label=r"Smoothed Trust $\tilde{\alpha}_t$ ($\zeta=1.0$)")
-    ax3c.plot(t_axis, rls_hist["p_opt"], color="#2980b9", linestyle="--", label=r"Path Optimality $p_{\mathrm{opt}}$ ($D_\psi$)")
-    ax3c.set_xlabel("Mission Time (s)")
-    ax3c.set_ylabel("Trust Parameter")
-    ax3c.set_ylim(-0.05, 1.05)
-    ax3c.legend(loc="lower left")
+    # (c) Novelty 1: Physics-Consistent Visual Gating Residual
+    r_vis_plot = rls_hist.get("r_vis", [0.0]*len(t_axis))
+    ax3c.plot(t_axis, r_vis_plot, color="#d35400", linewidth=1.6, label=r"Visual Gating Residual $\| r_{\mathrm{vis}} \|$ (PC-VG)")
+    ax3c.axhline(1.8, color="#c0392b", linestyle=":", alpha=0.8, label=r"Visual Gate $\tau_{\mathrm{vis}}$")
+    ax3c.axvspan(10.0, 15.0, color="#e74c3c", alpha=0.15)
+    ax3c.set_ylabel(r"$\| r_{\mathrm{vis}} \|$ (m/s)")
+    ax3c.legend(loc="upper right")
     ax3c.grid(True, linestyle=":", alpha=0.6)
+
+    # (d) Novelty 2: Tri-Brid Trust weights (VSLAM, Smoothed Trust, Path Optimality)
+    if "alpha_vslam" in rls_hist:
+        ax3d.plot(t_axis, rls_hist["alpha_vslam"], color="#e67e22", linestyle="-.", label=r"VSLAM Trust $\alpha_{\mathrm{vslam}}$ (PC-VG)")
+    ax3d.plot(t_axis, rls_hist["alpha_smoothed"], color="#27ae60", linewidth=2.0, label=r"Smoothed Trust $\tilde{\alpha}_t$ ($\zeta=1.0$)")
+    ax3d.plot(t_axis, rls_hist["p_opt"], color="#2980b9", linestyle="--", label=r"Path Optimality $p_{\mathrm{opt}}$ ($D_\psi$)")
+    ax3d.axvspan(10.0, 15.0, color="#e74c3c", alpha=0.15)
+    ax3d.set_xlabel("Mission Time (s)")
+    ax3d.set_ylabel("Trust Weight")
+    ax3d.set_ylim(-0.05, 1.05)
+    ax3d.legend(loc="lower left")
+    ax3d.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
     fig3.savefig(os.path.join(output_dir, "fig3_explainable_ai_dashboard.png"), dpi=300)
     fig3.savefig(os.path.join(output_dir, "fig3_explainable_ai_dashboard.pdf"))
@@ -463,19 +512,22 @@ def generate_publication_artifacts(
     # --------------------------------------------------------------------------
     fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(11, 4.8))
 
-    variants = [
-        "Variant 0 [RLS]",
-        "Variant 1 [SAC Freeze 0]",
-        "Variant 2 [SAC Freeze 1]",
-        "Variant 3 [SAC Freeze 2]",
-        "Variant 4 [SAC Freeze 3]"
-    ]
+    short_names_map = {
+        "Variant 0 [RLS]": "RLS",
+        "Variant 1 [SAC Freeze 0]": "SAC-F0",
+        "Variant 2 [SAC Freeze 1]": "SAC-F1",
+        "Variant 3 [SAC Freeze 2]": "SAC-F2",
+        "Variant 4 [SAC Freeze 3]": "SAC-F3",
+        "Paradigm B [PIN-ESN]": "PIN-ESN"
+    }
+
+    variants = [k for k in all_results.keys() if k != "Classical EKF"]
     rmses = [all_results[v]["rmse"] for v in variants]
     latencies = [all_results[v]["mean_latency_us"] for v in variants]
     bar_colors = [palette[v] for v in variants]
+    short_names = [short_names_map.get(v, v) for v in variants]
 
     # Bar chart of RMSE
-    short_names = ["RLS", "SAC-F0", "SAC-F1", "SAC-F2", "SAC-F3"]
     bars = ax4a.bar(short_names, rmses, color=bar_colors, edgecolor="black", alpha=0.85)
     ax4a.set_ylabel("Position RMSE (m)")
     ax4a.set_title("Tracking RMSE across Ablation Variants")
@@ -508,7 +560,8 @@ def generate_publication_artifacts(
     latex_table += "\\begin{tabular}{lcccc}\n\\toprule\n"
     latex_table += "\\textbf{Architecture / Adaptation} & \\textbf{ATE (m)} & \\textbf{RMSE (m)} & \\textbf{Max Jerk (m/s$^3$)} & \\textbf{Step Latency ($\\mu$s)} \\\\\n\\midrule\n"
 
-    all_keys = ["Classical EKF"] + variants
+    all_keys = ["Classical EKF"] if "Classical EKF" in all_results else []
+    all_keys += variants
     for key in all_keys:
         m = all_results[key]
         name_clean = key.replace("[", "(").replace("]", ")")
@@ -524,10 +577,13 @@ def generate_publication_artifacts(
 
 def main():
     torch.set_num_threads(2)
-    parser = argparse.ArgumentParser(description="Run 6-way closed-loop ablation paper benchmark.")
+    parser = argparse.ArgumentParser(description="Run closed-loop ablation paper benchmark.")
     parser.add_argument("--duration", type=float, default=20.0, help="Mission duration in seconds (default: 20.0)")
     parser.add_argument("--checkpoints-dir", type=str, default="./checkpoints", help="Path to pre-trained checkpoints")
     parser.add_argument("--figures-dir", type=str, default="./figures", help="Output directory for publication figures")
+    parser.add_argument("--only-paradigm-b", action="store_true", default=False, help="Fast benchmark only Paradigm B against Classical EKF and RLS")
+    parser.add_argument("--no-pin-esn", action="store_true", default=False, help="Disable Paradigm B [PIN-ESN] in ablation suite")
+    parser.add_argument("--render-cam", action="store_true", default=False, help="Render front camera snapshot for visual telemetry verification")
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -541,14 +597,23 @@ def main():
     print("  • GPS Spoofing:    t in [10.0, 15.0]s")
     print("  • LiDAR Blackout:  t in [10.0, 15.0]s")
 
-    controllers = [
-        "Classical EKF",
-        "Variant 0 [RLS]",
-        "Variant 1 [SAC Freeze 0]",
-        "Variant 2 [SAC Freeze 1]",
-        "Variant 3 [SAC Freeze 2]",
-        "Variant 4 [SAC Freeze 3]"
-    ]
+    if getattr(args, "only_paradigm_b", False):
+        controllers = [
+            "Classical EKF",
+            "Variant 0 [RLS]",
+            "Paradigm B [PIN-ESN]"
+        ]
+    else:
+        controllers = [
+            "Classical EKF",
+            "Variant 0 [RLS]",
+            "Variant 1 [SAC Freeze 0]",
+            "Variant 2 [SAC Freeze 1]",
+            "Variant 3 [SAC Freeze 2]",
+            "Variant 4 [SAC Freeze 3]"
+        ]
+        if not args.no_pin_esn:
+            controllers.append("Paradigm B [PIN-ESN]")
 
     results = {}
     for ctrl in controllers:
@@ -570,10 +635,23 @@ def main():
     print("=" * 80)
     latex_tbl = generate_publication_artifacts(results, output_dir=args.figures_dir)
 
+    # Render and save Approach A forward-facing camera snapshot for visual telemetry
+    try:
+        sample_env = UAVMujocoEnv()
+        sample_env.reset()
+        cam_frame = sample_env.render_front_cam(height=240, width=320)
+        if cam_frame is not None:
+            cam_path = os.path.join(args.figures_dir, "front_cam_sample.png")
+            matplotlib.image.imsave(cam_path, cam_frame)
+            print(f"  • front_cam_sample.png (Approach A telemetry camera view)")
+        sample_env.close()
+    except Exception:
+        pass
+
     print("\nSaved Figures in ./figures/:")
     print("  • fig1_3d_trajectory_tracking.png & .pdf")
     print("  • fig2_rmse_and_control_jerk.png & .pdf")
-    print("  • fig3_explainable_ai_dashboard.png & .pdf")
+    print("  • fig3_explainable_ai_dashboard.png & .pdf (4-panel: residuals, visual gating & trust)")
     print("  • fig4_ablation_pareto_chart.png & .pdf")
     print("  • table_metrics.tex")
 

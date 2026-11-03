@@ -289,6 +289,85 @@ class DynamicPrecisionBlendingObserver:
 
         return y_fused, diagnostics
 
+    def fuse_tri_brid(
+        self,
+        y_real: np.ndarray,
+        y_gan: np.ndarray,
+        vslam_pos: np.ndarray,
+        vslam_vel: np.ndarray,
+        alpha_vslam: float,
+        alpha_gps: float,
+        p_opt: float = 1.0
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Novelty 2: Tri-Brid Critically Damped Precision Blending Observer.
+        Fuses IMU, VSLAM, GPS, and cGAN virtual sensor:
+        1. When VSLAM is valid (alpha_vslam high), blends VSLAM with GPS to anchor drift.
+        2. When VSLAM suffers blackout/blur AND GPS is spoofed, dynamically switches
+           to the cGAN virtual sensor via the 2nd-order critically damped LPF (zeta = 1.0).
+        """
+        t0 = time.perf_counter_ns()
+        y_r = np.asarray(y_real, dtype=np.float64).copy()
+        y_g = np.asarray(y_gan, dtype=np.float64).copy()
+
+        # 1. Synthesize visual-inertial-GPS hybrid position & velocity
+        gps_pos = y_r[6:9]
+        gps_vel = y_r[9:12]
+
+        w_vslam = float(np.clip(alpha_vslam, 0.001, 0.999))
+        w_gps = float(np.clip(alpha_gps, 0.001, 0.999))
+        w_nav_total = w_vslam + w_gps
+
+        p_nav = (w_vslam * vslam_pos + w_gps * gps_pos) / w_nav_total
+        v_nav = (w_vslam * vslam_vel + w_gps * gps_vel) / w_nav_total
+
+        # Override GPS slots in y_r with navigation solution
+        y_r[6:9] = p_nav
+        y_r[9:12] = v_nav
+
+        # Overall navigation trust target
+        alpha_nav_raw = float(np.clip(max(alpha_vslam, alpha_gps), 0.001, 0.999))
+
+        # 2. Critically Damped Low-Pass Filtering (zeta = 1.0)
+        alpha_smoothed = float(self.lpf.step(alpha_nav_raw))
+        alpha_dot = float(self.lpf.rate)
+
+        # 3. Precision-Weighted Blending with cGAN virtual sensor
+        p_opt_clamped = float(np.clip(p_opt, 0.05, 1.0))
+        alpha_vec = np.full(self.sensor_dim, alpha_smoothed, dtype=np.float64)
+
+        w_real = alpha_vec * self.prec_real_nom
+        w_gan = (1.0 - alpha_vec) * p_opt_clamped * self.prec_gan_nom
+        w_total = w_real + w_gan
+
+        y_fused = (w_real * y_r + w_gan * y_g) / np.maximum(w_total, 1e-8)
+
+        # 4. Update kinematic state
+        dt = self.cfg.sim.dt
+        self.estimated_omega = y_fused[3:6]
+        fused_p = y_fused[6:9]
+        fused_v = y_fused[9:12]
+
+        self.estimated_vel = 0.9 * (self.estimated_vel + y_fused[0:3] * dt) + 0.1 * fused_v
+        self.estimated_pos = 0.95 * (self.estimated_pos + self.estimated_vel * dt) + 0.05 * fused_p
+
+        t1 = time.perf_counter_ns()
+        latency_us = (t1 - t0) / 1000.0
+
+        diagnostics = {
+            "alpha_raw": alpha_nav_raw,
+            "alpha_smoothed": alpha_smoothed,
+            "alpha_dot": alpha_dot,
+            "alpha_vslam": alpha_vslam,
+            "alpha_gps": alpha_gps,
+            "p_opt": p_opt_clamped,
+            "latency_us": latency_us,
+            "estimated_pos": self.estimated_pos.copy(),
+            "estimated_vel": self.estimated_vel.copy(),
+            "fallback_active": bool(alpha_smoothed < 0.3)
+        }
+        return y_fused, diagnostics
+
 
 # ==============================================================================
 # 3. Verification & Comparison Suite: Step-Fault Response

@@ -10,7 +10,7 @@ Implements:
 import sys
 from pathlib import Path
 from collections import deque
-from typing import List, Dict, Optional, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union, Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -181,14 +181,17 @@ class NoiseAndFaultAdapter:
         self.tau_thresh = tau_thresh if tau_thresh is not None else config.filter.tau_thresh
         self.k = k if k is not None else config.filter.sigmoid_slope
 
-        # Sensor modality residual indices in r_sens (13-dim):
+        # Sensor modality residual indices in r_sens:
         # 0:3 = accel, 3:6 = gyro, 6:9 = gps_pos, 9:12 = gps_vel, 12:13 = lidar
+        # 13:16 = vslam_pos, 16:19 = vslam_vel (when 19-dim VSLAM residual is provided)
         self.modality_slices = {
             "imu_accel": slice(0, 3),
             "imu_gyro": slice(3, 6),
             "gps_pos": slice(6, 9),
             "gps_vel": slice(9, 12),
-            "lidar": slice(12, 13)
+            "lidar": slice(12, 13),
+            "vslam_pos": slice(13, 16),
+            "vslam_vel": slice(16, 19)
         }
 
         # Sliding window ring buffers
@@ -211,16 +214,10 @@ class NoiseAndFaultAdapter:
 
         Args:
             r_phys: 6-dim physics residual or scalar norm.
-            r_sens: 13-dim concatenated sensor residual vector.
+            r_sens: 13-dim or 19-dim concatenated sensor residual vector.
 
         Returns:
-            trust_dict: Dictionary of raw trust scores in (0, 1) for:
-                - 'global': Scalar overall system trust
-                - 'imu_accel': Accelerometer trust
-                - 'imu_gyro': Gyroscope trust
-                - 'gps_pos': GPS position trust
-                - 'gps_vel': GPS velocity trust
-                - 'lidar': LiDAR distance trust
+            trust_dict: Dictionary of raw trust scores in (0, 1) across modalities.
         """
         r_phys_norm = float(np.linalg.norm(r_phys)) if isinstance(r_phys, np.ndarray) else float(r_phys)
         self.r_phys_history.append(r_phys_norm)
@@ -230,8 +227,9 @@ class NoiseAndFaultAdapter:
         mean_r_phys = float(np.mean(self.r_phys_history))
         mean_r_sens = np.mean(self.r_sens_history, axis=0)
 
-        # 1. Global scalar trust score
-        total_sens_norm = float(np.linalg.norm(mean_r_sens))
+        # 1. Global scalar trust score (using base 13 channels for backwards compatibility)
+        base_sens = mean_r_sens[:13]
+        total_sens_norm = float(np.linalg.norm(base_sens))
         global_discrepancy = mean_r_phys + total_sens_norm
         alpha_raw_global = self._sigmoid(self.k * (self.tau_thresh - global_discrepancy))
 
@@ -239,15 +237,64 @@ class NoiseAndFaultAdapter:
 
         # 2. Per-modality trust scores
         for modality, sl in self.modality_slices.items():
-            mod_sens_norm = float(np.linalg.norm(mean_r_sens[sl]))
-            # Combine modal sensor residual with physical disturbance residual
-            mod_discrepancy = 0.5 * mean_r_phys + mod_sens_norm
-            # Adjust modality threshold (e.g. GPS/LiDAR have different nominal scales)
-            mod_thresh = self.tau_thresh * (1.2 if "gps" in modality else 1.0)
-            alpha_mod = self._sigmoid(self.k * (mod_thresh - mod_discrepancy))
-            trust_dict[modality] = alpha_mod
+            if sl.stop <= mean_r_sens.shape[0]:
+                mod_sens_norm = float(np.linalg.norm(mean_r_sens[sl]))
+                mod_discrepancy = 0.5 * mean_r_phys + mod_sens_norm
+                mod_thresh = self.tau_thresh * (1.2 if ("gps" in modality or "vslam" in modality) else 1.0)
+                alpha_mod = self._sigmoid(self.k * (mod_thresh - mod_discrepancy))
+                trust_dict[modality] = alpha_mod
 
         return trust_dict
+
+    def compute_visual_gating(
+        self,
+        v_vslam: np.ndarray,
+        v_prev: np.ndarray,
+        rot_matrix: np.ndarray,
+        motor_thrusts: np.ndarray,
+        f_ext_hat: Optional[np.ndarray] = None,
+        dt: float = 0.002,
+        vslam_valid: bool = True,
+        vslam_quality: float = 1.0,
+        mass: float = 1.5,
+        gravity: float = 9.81
+    ) -> Dict[str, Any]:
+        """
+        Novelty 1: Physics-Consistent Visual Gating (PC-VG).
+        Computes dynamic momentum prediction and visual innovation residual r_vis:
+            a_pred = (R * [0, 0, sum(T)] + F_ext_hat) / mass + [0, 0, -g]
+            v_pred = v_prev + a_pred * dt
+            r_vis = ||v_vslam - v_pred||
+        If r_vis > tau_vis or vslam_valid is False, rejects visual update before filter divergence.
+        """
+        if not vslam_valid or vslam_quality < 0.2:
+            return {
+                "alpha_vslam": 0.001,
+                "r_vis": 10.0,
+                "vslam_accepted": False,
+                "scale_drift_detected": True
+            }
+
+        total_thrust = float(np.sum(motor_thrusts))
+        thrust_body = np.array([0.0, 0.0, total_thrust], dtype=np.float64)
+        thrust_world = rot_matrix @ thrust_body
+
+        f_ext = np.asarray(f_ext_hat[:3], dtype=np.float64) if f_ext_hat is not None else np.zeros(3)
+        acc_pred = (thrust_world + f_ext) / mass + np.array([0.0, 0.0, -gravity])
+        v_pred = v_prev + acc_pred * dt
+
+        r_vis = float(np.linalg.norm(v_vslam - v_pred))
+        tau_vis = 1.8  # Visual discrepancy threshold (m/s)
+
+        alpha_raw_vis = self._sigmoid(2.5 * (tau_vis - r_vis)) * float(np.clip(vslam_quality, 0.0, 1.0))
+        accepted = bool(r_vis <= tau_vis and alpha_raw_vis > 0.3)
+
+        return {
+            "alpha_vslam": float(np.clip(alpha_raw_vis, 0.001, 0.999)),
+            "r_vis": r_vis,
+            "vslam_accepted": accepted,
+            "scale_drift_detected": bool(r_vis > tau_vis)
+        }
 
     @staticmethod
     def _sigmoid(x: float) -> float:

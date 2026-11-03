@@ -25,6 +25,7 @@ import torch.optim as optim
 
 from config import GlobalConfig, CONFIG
 from models.pillar_b_sn_mlp import SpectrallyNormalizedMLP, extract_mlp_features
+from models.pin_esn import PhysicsInformedESN
 
 
 # ==============================================================================
@@ -453,21 +454,86 @@ class OnlineAnnealedSACAdapter:
 
 
 # ==============================================================================
-# 4. 5-Way Adaptation Manager / Factory
+# 3b. Paradigm B: Physics-Informed Echo State Network (PIN-ESN) Adapter
+# ==============================================================================
+
+class PIN_ESN_Adapter:
+    """
+    Paradigm B Adapter: Physics-Informed Echo State Network with closed-form RLS readout.
+    Wraps PhysicsInformedESN to provide a uniform predict / update continual adaptation interface.
+    """
+
+    def __init__(
+        self,
+        reservoir_dim: int = 128,
+        lambda_rls: float = 0.995,
+        device: Optional[torch.device] = None,
+        seed: int = 42
+    ):
+        self.device = device or torch.device("cpu")
+        self.model = PhysicsInformedESN(
+            state_dim=18,
+            phys_dim=6,
+            output_dim=6,
+            reservoir_dim=reservoir_dim,
+            spectral_radius=0.95,
+            sparsity=0.15,
+            leaking_rate=0.35,
+            input_scale=0.15,
+            lambda_rls=lambda_rls,
+            delta_p0=50.0,
+            device=self.device,
+            seed=seed
+        )
+        self.hidden_dim = reservoir_dim
+        self.output_dim = 6
+        self.param_dim = self.model.param_dim
+
+    def predict(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        precomputed_h3: Optional[np.ndarray] = None,
+        delta_p_vis: Optional[Union[np.ndarray, torch.Tensor]] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Forward prediction of disturbance wrench."""
+        return self.model.predict(x, delta_p_vis=delta_p_vis)
+
+    def update(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        r_phys: Union[np.ndarray, torch.Tensor],
+        precomputed_h3: Optional[np.ndarray] = None,
+        delta_p_vis: Optional[Union[np.ndarray, torch.Tensor]] = None
+    ) -> Tuple[np.ndarray, float]:
+        """Closed-form RLS adaptation step."""
+        return self.model.update(x, r_phys, delta_p_vis=delta_p_vis)
+
+    def reset(self):
+        """Resets reservoir state and covariance."""
+        self.model.reset()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Returns reservoir diagnostics."""
+        return self.model.get_stats()
+
+
+# ==============================================================================
+# 4. 5-Way Adaptation Manager / Factory (Extended with Paradigm B)
 # ==============================================================================
 
 def create_continual_adapter(
-    variant_idx: int,
+    variant_idx: Union[int, str],
     base_mlp: Optional[SpectrallyNormalizedMLP] = None,
     device: Optional[torch.device] = None
-) -> Union[RLSHeadAdapter, OnlineAnnealedSACAdapter]:
+) -> Union[RLSHeadAdapter, OnlineAnnealedSACAdapter, PIN_ESN_Adapter]:
     """
-    Factory creating one of the 5 continual adaptation variants:
+    Factory creating one of the continual adaptation variants:
     - Variant 0: RLS closed-form baseline (Head W4 updated analytically)
     - Variant 1: SAC Freeze 0 (All 4 layers updated via SAC gradients)
     - Variant 2: SAC Freeze 1 (Layer 1 frozen, layers 2, 3, 4 updated)
     - Variant 3: SAC Freeze 2 (Layers 1, 2 frozen, layers 3, 4 updated)
     - Variant 4: SAC Freeze 3 (Layers 1, 2, 3 frozen, only head 4 updated)
+    - Variant 5 / 'pin_esn': Paradigm B [PIN-ESN] (Recurrent reservoir + closed-form RLS)
     """
     device = device or torch.device("cpu")
     mlp = base_mlp if base_mlp is not None else SpectrallyNormalizedMLP(18, 64, 6).to(device)
@@ -481,18 +547,23 @@ def create_continual_adapter(
             freeze_depth=freeze_depth,
             device=device
         )
+    elif variant_idx in [5, "pin_esn", "pin-esn", "Paradigm B [PIN-ESN]"]:
+        return PIN_ESN_Adapter(reservoir_dim=128, lambda_rls=0.995, device=device)
     else:
-        raise ValueError(f"Unknown variant index {variant_idx}. Must be 0, 1, 2, 3, or 4.")
+        raise ValueError(f"Unknown variant index {variant_idx}. Must be 0, 1, 2, 3, 4, or 5 (PIN-ESN).")
 
 
 # ==============================================================================
 # 5. Verification & Benchmarking Suite
 # ==============================================================================
 
-def benchmark_5way_continual_adaptation(num_steps: int = 100) -> Dict[str, Dict[str, float]]:
+def benchmark_5way_continual_adaptation(
+    num_steps: int = 100,
+    include_pin_esn: bool = True
+) -> Dict[str, Dict[str, float]]:
     """
     Benchmarks single-step execution latency (microseconds), parameter counts,
-    and memory across all 5 plasticity-stability variants.
+    and memory across all plasticity-stability variants and Paradigm B.
     """
     device = torch.device("cpu")
     variant_names = [
@@ -502,25 +573,33 @@ def benchmark_5way_continual_adaptation(num_steps: int = 100) -> Dict[str, Dict[
         "Variant 3 [SAC Freeze 2]",
         "Variant 4 [SAC Freeze 3]"
     ]
+    if include_pin_esn:
+        variant_names.append("Paradigm B [PIN-ESN]")
 
     results = {}
 
     for idx, name in enumerate(variant_names):
         mlp = SpectrallyNormalizedMLP(18, 64, 6).to(device)
-        adapter = create_continual_adapter(idx, base_mlp=mlp, device=device)
+        v_key = 5 if "PIN-ESN" in name else idx
+        adapter = create_continual_adapter(v_key, base_mlp=mlp, device=device)
 
         latencies_us = []
         dummy_state = np.random.randn(18).astype(np.float32)
         dummy_r_phys = np.array([4.5, -3.0, 1.5, 0.05, 0.08, -0.04]) # ~5.6 N wind
         dummy_r_sens = np.random.randn(13).astype(np.float32) * 0.05
 
-        if isinstance(adapter, RLSHeadAdapter):
-            # Benchmark RLS analytical update latency
+        if isinstance(adapter, (RLSHeadAdapter, PIN_ESN_Adapter)):
+            # Benchmark analytical update latency
             for _ in range(num_steps):
                 _, lat = adapter.update(dummy_state, dummy_r_phys)
                 latencies_us.append(lat)
-            trainable_params = adapter.Theta.size # 65 * 6 = 390
-            total_params = mlp.count_parameters()["total"]
+            if isinstance(adapter, RLSHeadAdapter):
+                trainable_params = adapter.Theta.size # 65 * 6 = 390
+                total_params = mlp.count_parameters()["total"]
+            else:
+                stats = adapter.get_stats()
+                trainable_params = stats["trainable_params"]
+                total_params = adapter.model.W_in.numel() + adapter.model.W_res.numel() + trainable_params
         else:
             # Warm up SAC buffer
             for _ in range(adapter.batch_size + 5):

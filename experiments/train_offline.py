@@ -226,7 +226,7 @@ def train_offline_cgan_and_mlp(
     print(" Phase 2: Pre-Training Spectrally Normalized MLP Base Trunk")
     print("=" * 70)
 
-    mlp = SpectrallyNormalizedMLP(input_dim=18, hidden_dim=64, output_dim=6).to(dev)
+    mlp = SpectrallyNormalizedMLP(input_dim=18, hidden_dim=256, output_dim=6).to(dev)
     mlp_opt = optim.Adam(mlp.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
 

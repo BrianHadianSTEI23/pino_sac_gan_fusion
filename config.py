@@ -42,6 +42,16 @@ class SensorRates:
     imu_dt: float = 0.002         # 500 Hz (every physics step)
     gps_dt: float = 0.050         # 20 Hz (every 25 steps)
     lidar_dt: float = 0.020       # 50 Hz (every 10 steps)
+    vslam_dt: float = 0.0333      # 30 Hz (every ~16 steps)
+
+
+@dataclass
+class CameraConfig:
+    """Onboard forward telemetry camera configuration."""
+    width: int = 320
+    height: int = 240
+    fps: int = 30
+    fovy: float = 80.0
 
 
 @dataclass
@@ -58,6 +68,10 @@ class SensorNoiseConfig:
     # LiDAR: distance / range (m)
     lidar_std: float = 0.01
 
+    # VSLAM: Visual odometry pose & velocity (clean visual tracking)
+    vslam_pos_std: float = 0.03
+    vslam_vel_std: float = 0.02
+
 
 @dataclass
 class FaultProfileConfig:
@@ -67,6 +81,7 @@ class FaultProfileConfig:
     - Thermal IMU drift: linear bias ramp on gyroscope/accelerometer
     - GPS multipath/spoofing: high-amplitude bias offset + noise spike
     - LiDAR smoke blackout: complete loss / zeroing / divergence of ranges
+    - VSLAM failure: visual tracking loss / motion blur / scale drift
     """
     # Wind disturbance
     wind_start_time: float = 4.0
@@ -90,6 +105,12 @@ class FaultProfileConfig:
     lidar_fault_end_time: float = 15.0
     lidar_dropout_prob: float = 1.0  # 1.0 = total blackout (returns large / invalid readings)
 
+    # VSLAM visual tracking failure (motion blur, feature loss, smoke blackout)
+    vslam_fault_start_time: float = 10.0
+    vslam_fault_end_time: float = 15.0
+    vslam_motion_blur_thresh: float = 3.5  # Feature dropout if ||omega|| > 3.5 rad/s
+    vslam_scale_drift_rate: float = 0.08   # Scale unobservability drift factor
+
 
 @dataclass
 class FilterConfig:
@@ -107,6 +128,7 @@ class GlobalConfig:
     sim: SimConfig = field(default_factory=SimConfig)
     uav: UAVConfig = field(default_factory=UAVConfig)
     rates: SensorRates = field(default_factory=SensorRates)
+    camera: CameraConfig = field(default_factory=CameraConfig)
     noise: SensorNoiseConfig = field(default_factory=SensorNoiseConfig)
     faults: FaultProfileConfig = field(default_factory=FaultProfileConfig)
     filter: FilterConfig = field(default_factory=FilterConfig)
